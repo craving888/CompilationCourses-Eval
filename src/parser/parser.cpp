@@ -111,7 +111,11 @@ struct Parser {
         if (take("while")) {
             if (!take("(")) error("expected '('");
             auto condition = expr();
-            if (!take(")")) error("expected ')'");
+            if (!take(")")) {
+                error("expected ')'");
+                // An assignment suffix belongs to the malformed header here.
+                if (at("=")) throw Recover{};
+            }
             return node(K::While,start,std::move(condition),stmt());
         }
         if (take("break") || take("continue")) {
