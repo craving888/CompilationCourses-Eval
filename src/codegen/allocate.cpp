@@ -43,7 +43,7 @@ Allocation allocate_values(const ir::Function& f, bool optimize) {
             if (i.op == ir::Op::Load || i.op == ir::Op::Store) ++heat[i.data];
             if (i.dst >= 0) {
                 auto& r = ranges[i.dst];
-                r.start = pos;
+                if (i.op != ir::Op::Constant) r.start = pos;
                 r.finish = std::max(r.finish,pos);
                 if (r.block >= 0 && r.block != b) r.external = true;
                 r.block = b;
@@ -59,7 +59,7 @@ Allocation allocate_values(const ir::Function& f, bool optimize) {
     std::iota(locals.begin(),locals.end(),0);
     std::stable_sort(locals.begin(),locals.end(),[&](int x,int y){return heat[x]>heat[y];});
     for (int s : locals) {
-        if (a.saved == 8 || heat[s] < 3) break;
+        if (a.saved == 11 || heat[s] < 3) break;
         a.locals[s] = a.saved++;
     }
     std::sort(ranges.begin(),ranges.end(),[](auto x,auto y){return x.start<y.start;});

@@ -103,8 +103,15 @@ bool simplify_values(ir::Function& f) {
     bool changed = false;
     for (auto& b : f.blocks) {
         std::map<std::tuple<Op,std::string,int,int>,int> available;
+        std::vector<int> slot_value(f.slots,-1);
         for (auto& i : b) {
             for (auto& v : i.args) v = canonical(v);
+            if (i.op == Op::Store) slot_value[i.data] = i.args[0];
+            if (i.op == Op::Load) {
+                auto& value = slot_value[i.data];
+                if (value < 0) value = i.dst;
+                else { replace[i.dst] = value; changed = true; }
+            }
             if (i.op != Op::Unary && i.op != Op::Binary) continue;
             const int a = i.args[0], c = i.args.size() == 2 ? i.args[1] : -1;
             int equivalent = -1;
@@ -175,16 +182,181 @@ bool eliminate(ir::Function& f) {
     }
     return changed;
 }
+
+const Block* inline_body(const ir::Function& f) {
+    const auto& entry = f.blocks.front();
+    if (entry.empty() || entry.size() > 48 || entry.back().op != Op::Return) return nullptr;
+    return &entry;
+}
+
+void inline_calls(ir::Function& caller, const ir::Module& module, std::size_t current) {
+    for (auto& block : caller.blocks) {
+        Block code;
+        for (const auto& inst : block) {
+            if (inst.op != Op::Call) { code.push_back(inst); continue; }
+            const auto previous = module.begin()+current;
+            const auto callee = std::find_if(module.begin(),previous,[&](const auto& f) { return f.name == inst.name; });
+            const auto* body = callee != previous ? inline_body(*callee) : nullptr;
+            if (!body) { code.push_back(inst); continue; }
+
+            std::vector<int> values(callee->values,-1);
+            const int slot_base = caller.slots;
+            caller.slots += callee->slots;
+            for (auto copy : *body) {
+                if (copy.op == Op::Param) { values[copy.dst] = inst.args[copy.data]; continue; }
+                for (auto& arg : copy.args) arg = values[arg];
+                if (copy.op == Op::Return) {
+                    if (inst.dst >= 0) code.push_back({Op::Unary,inst.dst,copy.args,"+"});
+                    break;
+                }
+                if (copy.dst >= 0) copy.dst = values[copy.dst] = caller.values++;
+                if (copy.op == Op::Load || copy.op == Op::Store) copy.data += slot_base;
+                code.push_back(std::move(copy));
+            }
+        }
+        block = std::move(code);
+    }
+}
+
+bool tail_recursion(ir::Function& f) {
+    const auto tail_call = [&](const Block& b) {
+        if (b.size() < 2 || b.back().op != Op::Return || b.back().args.empty()) return false;
+        const auto& call = b[b.size()-2];
+        return call.op == Op::Call && call.name == f.name && call.dst == b.back().args[0];
+    };
+    if (std::none_of(f.blocks.begin(),f.blocks.end(),tail_call)) return false;
+    auto& entry = f.blocks.front();
+    // The lowering prologue writes each incoming parameter to its own slot.
+    std::vector<int> slots;
+    std::size_t first = 0;
+    for (int i = 0; i < f.arity; ++i) {
+        if (first+1 >= entry.size() || entry[first].op != Op::Param || entry[first].data != i ||
+            entry[first+1].op != Op::Store || entry[first+1].args[0] != entry[first].dst) return false;
+        slots.push_back(entry[first+1].data);
+        first += 2;
+    }
+    const int loop = static_cast<int>(f.blocks.size());
+    Block body(entry.begin()+first,entry.end());
+    entry.resize(first);
+    entry.push_back({Op::Jump,-1,{}, {},loop});
+    f.blocks.push_back(std::move(body));
+    for (auto& block : f.blocks) {
+        if (!tail_call(block)) continue;
+        auto args = std::move(block[block.size()-2].args);
+        block.resize(block.size()-2);
+        for (int i = 0; i < f.arity; ++i)
+            block.push_back({Op::Store,-1,{args[i]},{},slots[i]});
+        block.push_back({Op::Jump,-1,{}, {},loop});
+    }
+    return true;
+}
+
+bool optimize_simple_loops(ir::Function& f) {
+    std::vector<std::vector<int>> predecessors(f.blocks.size());
+    for (int b=0; b<static_cast<int>(f.blocks.size()); ++b)
+        for (int s : successors(f.blocks[b])) predecessors[s].push_back(b);
+    std::vector<Constant> constants(f.values);
+    std::vector<int> definitions(f.values,-1);
+    for (int b=0; b<static_cast<int>(f.blocks.size()); ++b)
+        for (const auto& i : f.blocks[b]) {
+            if (i.dst >= 0) definitions[i.dst] = b;
+            if (i.op == Op::Constant) constants[i.dst] = i.data;
+        }
+
+    for (int head=1; head<static_cast<int>(f.blocks.size()); ++head) {
+        auto& header = f.blocks[head];
+        if (header.empty() || header.back().op != Op::Branch || predecessors[head].size() != 2) continue;
+        const int body_id = header.back().data;
+        if (body_id == head || predecessors[body_id] != std::vector<int>{head}) continue;
+        auto& body = f.blocks[body_id];
+        if (successors(body) != std::vector<int>{head}) continue;
+        const int before = predecessors[head][0] == body_id ? predecessors[head][1] : predecessors[head][0];
+        auto& preheader = f.blocks[before];
+        if (successors(preheader) != std::vector<int>{head}) continue;
+
+        // The only effect of a finite, otherwise empty counted loop is its
+        // final private counter value. Remove it only when that value is dead.
+        if (header.size() == 4 && body.size() == 5 &&
+            header[0].op == Op::Load && header[1].op == Op::Constant &&
+            header[2].op == Op::Binary && header[2].name == "<" &&
+            header[2].args == std::vector<int>{header[0].dst,header[1].dst} &&
+            header[3].args[0] == header[2].dst &&
+            body[0].op == Op::Load && body[0].data == header[0].data &&
+            body[1].op == Op::Constant && body[1].data == 1 &&
+            body[2].op == Op::Binary && body[2].name == "+" &&
+            body[2].args == std::vector<int>{body[0].dst,body[1].dst} &&
+            body[3].op == Op::Store && body[3].data == header[0].data &&
+            body[3].args[0] == body[2].dst) {
+            const int counter = header[0].data;
+            const auto init = std::find_if(preheader.rbegin(),preheader.rend(),[&](const Inst& i) {
+                return i.op == Op::Store && i.data == counter;
+            });
+            bool live = false;
+            for (int b=0; b<static_cast<int>(f.blocks.size()) && !live; ++b) {
+                if (b == head || b == body_id) continue;
+                for (const auto& i : f.blocks[b]) {
+                    if (i.op == Op::Load && i.data == counter) live = true;
+                    for (int v : i.args) if (definitions[v] == head || definitions[v] == body_id) live = true;
+                }
+            }
+            if (init != preheader.rend() && constants[init->args[0]] && !live) {
+                preheader.back().data = header.back().other;
+                return true;
+            }
+        }
+
+        std::vector<bool> written(f.slots);
+        for (const auto* block : {&header,&body})
+            for (const auto& i : *block) if (i.op == Op::Store) written[i.data] = true;
+        std::vector<int> candidates(f.values,-1);
+        for (std::size_t pos=0; pos<body.size(); ++pos) {
+            const auto& i = body[pos];
+            if (i.dst < 0) continue;
+            bool pure = i.op == Op::Constant || i.op == Op::Unary ||
+                        (i.op == Op::Load && !written[i.data]) || i.op == Op::Binary;
+            if (i.op == Op::Binary && (i.name == "/" || i.name == "%")) {
+                const auto divisor = constants[i.args[1]];
+                pure = divisor && *divisor != 0 && *divisor != -1;
+            }
+            if (pure && std::all_of(i.args.begin(),i.args.end(),[&](int v) {
+                return candidates[v] >= 0 || (definitions[v] != head && definitions[v] != body_id);
+            })) candidates[i.dst] = static_cast<int>(pos);
+        }
+        std::vector<bool> move(body.size());
+        for (std::size_t pos=0; pos<body.size(); ++pos) {
+            const auto& i = body[pos];
+            if (i.op == Op::Binary && candidates[i.dst] >= 0 && (i.name == "*" || i.name == "/" || i.name == "%"))
+                move[pos] = true;
+        }
+        if (std::none_of(move.begin(),move.end(),[](bool m) {return m;})) continue;
+        for (int pos=static_cast<int>(body.size())-1; pos>=0; --pos)
+            if (move[pos])
+                for (int v : body[pos].args)
+                    if (candidates[v] >= 0) move[candidates[v]] = true;
+        Block kept;
+        for (std::size_t pos=0; pos<body.size(); ++pos) {
+            if (move[pos]) preheader.insert(preheader.end()-1,std::move(body[pos]));
+            else kept.push_back(std::move(body[pos]));
+        }
+        body = std::move(kept);
+        return true;
+    }
+    return false;
+}
 }
 
 void optimize_ir(ir::Module& m) {
-    for (auto& f : m) {
+    for (std::size_t index=0; index<m.size(); ++index) {
+        auto& f = m[index];
+        tail_recursion(f);
+        inline_calls(f,m,index);
         bool changed;
         do {
             changed = prune(f);
             changed |= propagate(f);
             changed |= simplify_values(f);
             changed |= eliminate(f);
+            if (!changed) changed = optimize_simple_loops(f);
         } while (changed);
     }
 }
